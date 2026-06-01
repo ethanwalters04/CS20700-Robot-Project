@@ -13,6 +13,8 @@ Later this file will contain:
 from usys import stdin, stdout
 from uselect import poll
 from pybricks.tools import wait
+from pybricks.hubs import PrimeHub
+from pybricks.parameters import Color
 
 
 # ============================================================
@@ -21,6 +23,20 @@ from pybricks.tools import wait
 
 # CHANGE THIS TO CHANGE MOVEMENT TIME
 MOVE_TIME_MS = 3000
+
+
+# ============================================================
+# HARDWARE INITIALIZATION
+# ============================================================
+
+hub = PrimeHub()
+
+# Play a short, quiet beep to indicate it's connected/running
+hub.speaker.volume(20)  # 20% volume for a quiet beep
+hub.speaker.beep(frequency=500, duration=100)
+
+# Set base color to indicate it is connected and ready
+hub.light.on(Color.GREEN)
 
 
 # ============================================================
@@ -72,6 +88,10 @@ while True:
 
     received_message = stdin.readline().strip()
 
+    # Set light to red while processing command
+    hub.light.on(Color.RED)
+    hub.speaker.beep(frequency=500, duration=100)
+
     # ========================================================
     # MOVE COMMAND
     # ========================================================
@@ -95,3 +115,7 @@ while True:
     else:
 
         stdout.write("UNKNOWN_COMMAND\n")
+    
+    # Reset light to green after processing command
+    hub.light.on(Color.GREEN)
+    hub.speaker.beep(frequency=500, duration=100)

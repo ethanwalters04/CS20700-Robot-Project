@@ -1,235 +1,126 @@
 # SPDX-License-Identifier: MIT
 
 """
-MAIN SYSTEM CONTROLLER
+Laptop → Multi-Pybricks Hub Controller
 
-This laptop program coordinates BOTH hubs:
-
-1. Cup Hub
-   - Moves the cup between stations
-
-2. Bottle Hub
-   - Dispenses liquids
-   - Controls mixer
-
-===============================================================
-SYSTEM FLOW
-===============================================================
-
-Select recipe
-    ↓
-Move cup to bottle station
-    ↓
-Dispense liquid
-    ↓
-Repeat for all ingredients
-    ↓
-Move cup to mixer
-    ↓
-Mix drink
-    ↓
-Move cup to home station
-
-===============================================================
-PHYSICAL LAYOUT
-===============================================================
-
-station_home
-    ↓
-station_mixer
-    ↓
-station_bottle1
-    ↓
-station_bottle2
-    ↓
-station_bottle3
-
-===============================================================
+This program:
+1. Connects to multiple Pybricks hubs (Cup Hub and Bottle Hub).
+2. Manages separate communication buffers for each.
+3. Provides a dedicated logic loop for coordinating tasks between them.
+4. Uses specific target messages to safely wait for tasks to finish.
 """
 
 import asyncio
-import random
 from contextlib import suppress
-
 from bleak import BleakScanner, BleakClient
 
-
 # ============================================================
-# HUB CONFIGURATION
-# ============================================================
-
-# CHANGE THESE TO MATCH YOUR HUB NAMES
-CUP_HUB_NAME = "Cup Hub"
-BOTTLE_HUB_NAME = "Bottle Hub"
-
-PYBRICKS_COMMAND_EVENT_CHAR_UUID = (
-    "c5f50002-8280-46da-89f4-6d8051e4aeef"
-)
-
-
-# ============================================================
-# RECIPE DEFINITIONS
+# CONFIGURATION
 # ============================================================
 
-"""
-===============================================================
-RECIPE SELECTION GOES HERE
-===============================================================
-
-Each recipe is a list of ingredients.
-
-Each ingredient contains:
-    station name
-    dispense duration in seconds
-
-Example:
-("station_bottle1", 2.0)
-
-means:
-    move to bottle 1
-    dispense for 2 seconds
-
-===============================================================
-"""
-
-RECIPES = [
-
-    # Recipe 1
-    [
-        ("station_bottle1", 2.0),
-        ("station_bottle2", 2.0),
-    ],
-
-    # Recipe 2
-    [
-        ("station_bottle1", 1.0),
-        ("station_bottle3", 3.0),
-    ],
-
-    # Recipe 3
-    [
-        ("station_bottle2", 2.5),
-        ("station_bottle3", 1.5),
-    ],
-
-    # Recipe 4
-    [
-        ("station_bottle1", 1.5),
-        ("station_bottle2", 1.5),
-        ("station_bottle3", 1.5),
-    ],
-
-    # Recipe 5
-    [
-        ("station_bottle3", 4.0),
-    ],
-]
-
+PYBRICKS_COMMAND_EVENT_CHAR_UUID = "c5f50002-8280-46da-89f4-6d8051e4aeef"
 
 # ============================================================
-# HUB CONTROLLER CLASS
+# HUB CONNECTION CLASS
 # ============================================================
 
-class HubController:
-
-    def __init__(self, hub_name):
-
-        self.hub_name = hub_name
-
+class PybricksHub:
+    """Manages the BLE connection and messaging for a single Pybricks Hub."""
+    
+    def __init__(self, name: str):
+        self.name = name
         self.client = None
-
+        
+        # Signals that hub is ready for another command
         self.ready_event = asyncio.Event()
+        
+        # Signals that hub has sent the specific message we are waiting for
         self.response_event = asyncio.Event()
-
+        
+        # Buffer for assembling BLE packet fragments
         self.rx_buffer = bytearray()
-
+        
+        # Stores latest received hub message
         self.latest_response = ""
+        
+        # Tracks the specific message we are waiting to receive
+        self.target_message = None 
 
     async def connect(self):
-
-        print(f"Searching for {self.hub_name}...")
-
-        device = await BleakScanner.find_device_by_name(
-            self.hub_name
-        )
-
+        """Finds and connects to the hub."""
+        print(f"[{self.name}] Scanning...")
+        device = await BleakScanner.find_device_by_name(self.name)
+        
         if device is None:
-            raise Exception(
-                f"Could not find hub '{self.hub_name}'"
-            )
+            print(f"[{self.name}] Error: Could not find hub.")
+            return False
 
-        self.client = BleakClient(
-            device,
-            self.handle_disconnect
-        )
+        def handle_disconnect(_):
+            print(f"\n[{self.name}] Disconnected.")
 
+        self.client = BleakClient(device, disconnected_callback=handle_disconnect)
         await self.client.connect()
-
+        
         await self.client.start_notify(
             PYBRICKS_COMMAND_EVENT_CHAR_UUID,
-            self.handle_rx
+            self._handle_rx
         )
+        print(f"[{self.name}] Connected successfully.")
+        return True
 
-        print(f"Connected to {self.hub_name}")
-
-    def handle_disconnect(self, _):
-
-        print(f"{self.hub_name} disconnected.")
-
-    def handle_rx(self, _, data: bytearray):
-
+    def _handle_rx(self, _, data: bytearray):
+        """Internal callback to handle incoming BLE data."""
+        # Ignore non-stdout packets
         if data[0] != 0x01:
             return
 
+        # Remove Pybricks protocol byte and add to buffer
         payload = data[1:]
-
         self.rx_buffer.extend(payload)
 
+        # Process complete newline-delimited messages
         while b"\n" in self.rx_buffer:
-
             line, _, remainder = self.rx_buffer.partition(b"\n")
             self.rx_buffer[:] = remainder
 
             received_message = line.decode().strip()
 
             if received_message == "READY":
-
                 self.ready_event.set()
-
             else:
-
                 self.latest_response = received_message
-
-                print(
-                    f"[{self.hub_name}] "
-                    f"{self.latest_response}"
-                )
-
-                # Any response ending with DONE or ARRIVED
-                # is treated as task completion.
-                if (
-                    "DONE" in received_message
-                    or "ARRIVED" in received_message
-                ):
+                print(f"[{self.name}] says: {self.latest_response}")
+                
+                # Check if this message is the specific one we are waiting for
+                if self.target_message and self.target_message in received_message:
                     self.response_event.set()
+                    self.target_message = None # Reset it after we find it
 
-    async def send(self, command):
-
+    async def send(self, command: str):
+        """Sends a command string to the hub."""
+        # Wait for hub ready signal
         await self.ready_event.wait()
-
+        
+        # Prepare for next READY
         self.ready_event.clear()
 
-        self.response_event.clear()
-
         payload = (command + "\n").encode()
-
         await self.client.write_gatt_char(
             PYBRICKS_COMMAND_EVENT_CHAR_UUID,
             b"\x06" + payload,
             response=True
         )
 
+    async def wait_for(self, target: str):
+        """Pauses the script until the hub sends a message containing the target string."""
+        self.target_message = target
+        self.response_event.clear()
         await self.response_event.wait()
+
+    async def disconnect(self):
+        """Safely closes the connection."""
+        if self.client and self.client.is_connected:
+            await self.client.disconnect()
 
 
 # ============================================================
@@ -237,91 +128,115 @@ class HubController:
 # ============================================================
 
 async def main():
+    
+    # 1. Initialize hub objects
+    cup_hub = PybricksHub("Cup Hub")
+    bottle_hub = PybricksHub("Bottle Hub")
 
-    # Create controllers
-    cup_hub = HubController(CUP_HUB_NAME)
-    bottle_hub = HubController(BOTTLE_HUB_NAME)
+    # 2. Connect to all hubs
+    print("Initializing connections...")
+    
+    cup_connected = await cup_hub.connect()
+    bottle_connected = await bottle_hub.connect()
 
-    # Connect to hubs
-    await cup_hub.connect()
-    await bottle_hub.connect()
+    if not (cup_connected and bottle_connected):
+        print("Failed to connect to all required hubs. Exiting.")
+        return
 
-    print("\nStart BOTH hub programs now.")
+    print("\nAll hubs connected! Start the hub programs using the hub buttons.")
+    
+    # Wait for the user to press the button on both hubs (triggering the first READY)
+    print("Waiting for both hubs to send READY signal...")
+    await asyncio.gather(
+        cup_hub.ready_event.wait(),
+        bottle_hub.ready_event.wait()
+    )
+    
+    print("\n--- SYSTEM READY ---")
 
-    await asyncio.sleep(2)
+    try:
+        while True:
+            
+            # ============================================================
+            # >>> START OF CUSTOM COORDINATION LOGIC
+            # ============================================================
+            
+            # This is a basic prompt to keep the loop alive manually. 
+            # In a fully autonomous system, you could replace this prompt 
+            # with computer vision triggers or timed sequences.
+            user_input = input("\nPress Enter to run a cycle, or 'q' to quit: ").strip()
+            
+            if user_input.lower() == 'q':
+                break
 
-    """
-    ===========================================================
-    RANDOM RECIPE SELECTION HAPPENS HERE
-    ===========================================================
-    """
+            print("\n[Coordination Logic Executing...]")
+            
+            """
+            ============================================================
+            HUB COMMUNICATION API REFERENCE
+            ============================================================
+            Use the following methods to coordinate your connected hubs.
 
-    selected_recipe = random.choice(RECIPES)
+            1. SENDING COMMANDS
+               Send a string message to a specific hub.
+               -> await my_hub.send("COMMAND_STRING")
 
-    print("\nSelected recipe:")
-    print(selected_recipe)
+            2. WAITING FOR SPECIFIC REPLIES (Recommended)
+               Pause the script until the hub replies with a specific string.
+               This safely ignores intermediate messages or echoes.
+               -> await my_hub.wait_for("EXPECTED_REPLY")
 
-    # ========================================================
-    # EXECUTE RECIPE
-    # ========================================================
+            3. READING THE LAST MESSAGE (Non-blocking)
+               Access the most recently received string from the hub at any 
+               time without pausing the script.
+               -> current_status = my_hub.latest_response
 
-    for station_name, dispense_time in selected_recipe:
+            4. SIMULTANEOUS EXECUTION
+               Execute actions on multiple hubs at the exact same time.
+               -> await asyncio.gather(
+                      hub_a.send("TASK_1"),
+                      hub_b.send("TASK_2")
+                  )
+                  
+            5. SIMULTANEOUS WAITING
+               Pause the script until MULTIPLE hubs finish their tasks.
+               -> await asyncio.gather(
+                      hub_a.wait_for("TASK_1_DONE"),
+                      hub_b.wait_for("TASK_2_DONE")
+                  )
+            ============================================================
+            """
 
-        # ----------------------------------------------------
-        # MOVE CUP TO BOTTLE
-        # ----------------------------------------------------
+            # Example: Send message to Cup Hub
+            # await cup_hub.send("MOVE:1")
+            # await cup_hub.wait_for("ARRIVED") 
+            
+            # Example: Send message to Bottle Hub
+            # await bottle_hub.send("POUR:50")
+            # await bottle_hub.wait_for("DONE_POURING")
+            
+            print("[Coordination Logic Complete]")
 
-        move_command = f"MOVE:{station_name}"
+            # ============================================================
+            # <<< END OF CUSTOM COORDINATION LOGIC
+            # ============================================================
 
-        print(f"\nMoving cup to {station_name}")
-
-        await cup_hub.send(move_command)
-
-        # ----------------------------------------------------
-        # DISPENSE LIQUID
-        # ----------------------------------------------------
-
-        dispense_command = (
-            f"DISPENSE:{station_name}:{dispense_time}"
+    finally:
+        # 3. Clean up and disconnect
+        print("\nShutting down connections...")
+        
+        # Send 'bye' command to safely shut down the Python scripts on the hubs
+        await asyncio.gather(
+            cup_hub.send("bye"),
+            bottle_hub.send("bye")
         )
-
-        print(
-            f"Dispensing from {station_name} "
-            f"for {dispense_time} seconds"
-        )
-
-        await bottle_hub.send(dispense_command)
-
-    # ========================================================
-    # MOVE TO MIXER
-    # ========================================================
-
-    print("\nMoving cup to mixer")
-
-    await cup_hub.send("MOVE:station_mixer")
-
-    # ========================================================
-    # MIX DRINK
-    # ========================================================
-
-    print("\nMixing drink")
-
-    await bottle_hub.send("MIX:3")
-
-    # ========================================================
-    # RETURN HOME
-    # ========================================================
-
-    print("\nReturning cup to home")
-
-    await cup_hub.send("MOVE:station_home")
-
-    print("\nDrink complete.")
-
-    # Optional shutdown
-    await cup_hub.send("bye")
-    await bottle_hub.send("bye")
-
+        
+        # Give hubs a tiny moment to process the bye command before killing the Bluetooth link
+        await asyncio.sleep(0.5) 
+        
+        await cup_hub.disconnect()
+        await bottle_hub.disconnect()
+        print("Program complete.")
 
 # ============================================================
 # ENTRY POINT
